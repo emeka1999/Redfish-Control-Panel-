@@ -28,28 +28,9 @@ from PyQt5.QtWidgets import (
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
-# Optional: Selenium for Web SOL auto-login
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.service import Service as ChromeService
-except Exception:
-    webdriver = None
-    ChromeOptions = None
-    WebDriverWait = None
-    EC = None
-    ChromeService = None
-
-# Optional: driver manager
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-except Exception:
-    ChromeDriverManager = None
-
-
+# Import our new UI module
+from virtual_media_tab import VirtualMediaTab
+from firmware_tab import FirmwareTab
 # ---------------------------
 # Backend client
 # ---------------------------
@@ -202,20 +183,11 @@ class RedfishClient:
             return False, f"{type(e).__name__}: {e}", 0
 
     def put_local_file_best_effort(self, file_bytes: bytes, filename: str = "image.bin"):
-        """
-        Local-file firmware upload via Basic Auth (no session token).
-        Order:
-        1) PUT  -> UpdateService.HttpPushUri (e.g., .../update)         [classic curl -T]
-        2) POST -> UpdateService.HttpPushUri (octet-stream)
-        3) POST -> UpdateService.MultipartHttpPushUri (multipart/form-data; UpdateFile=@...)
-        4) PUT  -> /redfish/v1/UpdateService (legacy variants)
-        Returns (ok, data, status) where data includes {"used": {"method","url"}, "trace":[...]}.
-        """
         headers_octet = {
             "Content-Type": "application/octet-stream",
             "Accept": "*/*",
-            "Expect": "",           # avoid 100-continue quirks
-            "Connection": "close",  # keep it simple for some BMCs
+            "Expect": "",           
+            "Connection": "close",  
         }
         auth = HTTPBasicAuth(self.cfg.username, self.cfg.password)
 
@@ -230,7 +202,6 @@ class RedfishClient:
             ok = resp.ok or resp.status_code in (200, 201, 202, 204)
             return ok, {"status": resp.status_code, "data": body, "used": {"method": method, "url": url}, "trace": trace}, resp.status_code
 
-        # Discover advertised endpoints
         http_uri = None
         mp_uri = None
         ok_us, svc, _ = self.get("/redfish/v1/UpdateService")
@@ -249,24 +220,21 @@ class RedfishClient:
             candidates_put += [self.url(http_uri)]
             if not http_uri.endswith("/"):
                 candidates_put += [self.url(http_uri + "/")]
-            candidates_post = list(candidates_put)  # same base for POST
+            candidates_post = list(candidates_put)  
         if mp_uri:
             candidates_mp += [self.url(mp_uri)]
             if not mp_uri.endswith("/"):
                 candidates_mp += [self.url(mp_uri + "/")]
 
-        # 1) Classic: PUT HttpPushUri
         for u in candidates_put:
             try:
                 r = requests.put(u, data=file_bytes, headers=headers_octet, auth=auth,
                                 timeout=self.cfg.timeout, verify=self.cfg.verify, allow_redirects=False)
                 ok, data, code = _rec("PUT HttpPushUri", "PUT", u, r)
                 if ok: return ok, data, code
-                # If 405, try POST next; we'll continue to next branch
             except Exception as e:
                 trace.append({"step": "PUT HttpPushUri EXC", "url": u, "error": f"{type(e).__name__}: {e}"})
 
-        # 2) POST octet-stream to HttpPushUri (some builds require POST not PUT)
         for u in candidates_post:
             try:
                 r = requests.post(u, data=file_bytes, headers=headers_octet, auth=auth,
@@ -276,7 +244,6 @@ class RedfishClient:
             except Exception as e:
                 trace.append({"step": "POST HttpPushUri EXC", "url": u, "error": f"{type(e).__name__}: {e}"})
 
-        # 3) Multipart upload to MultipartHttpPushUri
         for u in candidates_mp:
             try:
                 files = {"UpdateFile": (filename, file_bytes)}
@@ -291,7 +258,6 @@ class RedfishClient:
             except Exception as e:
                 trace.append({"step": "POST Multipart EXC", "url": u, "error": f"{type(e).__name__}: {e}"})
 
-        # 4) Legacy fallback: PUT /UpdateService, with and without trailing slash
         for u in [self.url("/redfish/v1/UpdateService"), self.url("/redfish/v1/UpdateService/")]:
             try:
                 r = requests.put(u, data=file_bytes, headers=headers_octet, auth=auth,
@@ -301,7 +267,6 @@ class RedfishClient:
             except Exception as e:
                 trace.append({"step": "PUT legacy EXC", "url": u, "error": f"{type(e).__name__}: {e}"})
 
-        # If nothing worked, return the last entry’s info
         return False, {"status": 405, "data": {"error": {"message": "All local-file methods rejected"}}, "trace": trace}, 405
 
     def simple_update(self, target: str, image_uri: str) -> Tuple[bool, Any, int]:
@@ -313,35 +278,47 @@ class RedfishClient:
         return self.get("/redfish/v1/UpdateService")
 
     def put_firmware_octet(self, file_bytes: bytes) -> Tuple[bool, Any, int]:
-        # Your backend allowed PUT /redfish/v1/UpdateService. Keep as an option.
         return self.put_octet_stream("/redfish/v1/UpdateService", file_bytes)
 
-    def upload_auto(self, file_bytes: Optional[bytes], filename: Optional[str],
-                    image_uri: Optional[str] = None, mode: str = "auto", **_):
-        """
-        Legacy-first uploader (original behavior):
-        - For any mode EXCEPT 'simple*' -> PUT /redfish/v1/UpdateService (octet-stream)
-        - For 'simple*' -> POST UpdateService.SimpleUpdate with ImageURI
-        """
-        # SimpleUpdate path (URL only)
-        if str(mode).lower().startswith("simple"):
-            ok_us, svc, _ = self.get_update_service()
-            if not ok_us or not isinstance(svc, dict) or not isinstance(svc.get("data"), dict):
-                return False, {"status": 0, "data": {"error": "UpdateService not available"}}, 0
-            actions = svc["data"].get("Actions") or {}
-            simple = actions.get("#UpdateService.SimpleUpdate") or {}
-            target = simple.get("target")
-            if not target:
-                return False, {"status": 405, "data": {"error": "SimpleUpdate not supported"}}, 405
-            if not image_uri:
-                return False, {"status": 400, "data": {"error": "ImageURI required"}}, 400
-            return self.simple_update(target, image_uri)
-
-        # All other modes -> legacy PUT /UpdateService (octet-stream)
-        if not file_bytes:
-            return False, {"status": 400, "data": {"error": "No file selected"}}, 400
-        return self.put_firmware_octet(file_bytes)
+    # ---- Virtual Media helpers ----
+    def get_virtual_media(self) -> Tuple[bool, Any, int]:
+        """Discover Virtual Media endpoints."""
+        ok, data, code = self.get("/redfish/v1/Managers")
+        if not ok or not isinstance(data.get("data"), dict):
+            return False, {"error": "Failed to get Managers"}, code
         
+        members = data["data"].get("Members", [])
+        vm_endpoints = []
+        for m in members:
+            mgr_id = m.get("@odata.id")
+            if mgr_id:
+                vm_url = f"{mgr_id}/VirtualMedia"
+                ok_vm, vm_data, _ = self.get(vm_url)
+                if ok_vm and isinstance(vm_data.get("data"), dict):
+                    for v in vm_data["data"].get("Members", []):
+                        v_id = v.get("@odata.id")
+                        if v_id:
+                            vm_endpoints.append(v_id)
+        
+        if not vm_endpoints:
+            return False, {"error": "No VirtualMedia endpoints found"}, 404
+            
+        return True, {"endpoints": vm_endpoints}, 200
+
+    def get_virtual_media_status(self, endpoint: str) -> Tuple[bool, Any, int]:
+        return self.get(endpoint)
+
+    def insert_virtual_media(self, endpoint: str, image_url: str, user: str = "", password: str = "") -> Tuple[bool, Any, int]:
+        payload = {"Image": image_url, "Inserted": True}
+        if user:
+            payload["UserName"] = user
+        if password:
+            payload["Password"] = password
+        return self.post_json(f"{endpoint}/Actions/VirtualMedia.InsertMedia", payload)
+
+    def eject_virtual_media(self, endpoint: str) -> Tuple[bool, Any, int]:
+        return self.post_json(f"{endpoint}/Actions/VirtualMedia.EjectMedia", {})
+
     # ---- Quick probe ----
     def test_connection(self) -> Tuple[bool, Any, int]:
         ok, data, code = self.head("/redfish/v1")
@@ -351,10 +328,8 @@ class RedfishClient:
 
     # ---- Sensors discovery helpers ----
     def discover_sensor_paths(self) -> List[str]:
-        """Return a list of sensor instance paths with readings."""
         paths: List[str] = []
 
-        # 1) Try canonical OpenBMC path
         ok, data, _ = self.get("/redfish/v1/Chassis/chassis/Sensors")
         if ok and isinstance(data, dict) and isinstance(data.get("data"), dict):
             members = data["data"].get("Members") or []
@@ -363,7 +338,6 @@ class RedfishClient:
                 if isinstance(p, str):
                     paths.append(p)
 
-        # 2) Enumerate /Chassis and try each Sensors collection
         ok, data, _ = self.get("/redfish/v1/Chassis")
         if ok and isinstance(data, dict) and isinstance(data.get("data"), dict):
             members = data["data"].get("Members") or []
@@ -378,14 +352,12 @@ class RedfishClient:
                         if isinstance(p, str) and p not in paths:
                             paths.append(p)
                 else:
-                    # 3) Fallback: Thermal Temperatures as pseudo-sensors
                     ok3, th, _ = self.get(f"{ch}/Thermal")
                     if ok3 and isinstance(th, dict) and isinstance(th.get("data"), dict):
                         temps = th["data"].get("Temperatures") or []
                         for i, _t in enumerate(temps):
                             paths.append(f"{ch}/Thermal#Temperatures/{i}")
 
-        # 4) Some platforms mount under Systems/system/Sensors
         ok, data, _ = self.get("/redfish/v1/Systems/system/Sensors")
         if ok and isinstance(data, dict) and isinstance(data.get("data"), dict):
             for m in data["data"].get("Members") or []:
@@ -393,7 +365,6 @@ class RedfishClient:
                 if isinstance(p, str) and p not in paths:
                     paths.append(p)
 
-        # De-dup
         seen = set(); dedup: List[str] = []
         for p in paths:
             if p not in seen:
@@ -401,10 +372,6 @@ class RedfishClient:
         return dedup
 
     def read_sensor(self, path: str) -> Optional[Dict[str, Any]]:
-        """
-        Return {"name", "reading", "units", "path"} or None.
-        For Thermal fallback, 'path' looks like ".../Thermal#Temperatures/idx".
-        """
         if "#Temperatures/" in path:
             chassis_path, idx = path.split("#Temperatures/")
             ok, d, _ = self.get(f"{chassis_path}/Thermal")
@@ -584,11 +551,13 @@ class MainWindow(QMainWindow):
         self.power_tab = QWidget(); self.tabs.addTab(self.power_tab, "Power"); self._build_power_tab()
         self.sensors_tab = QWidget(); self.tabs.addTab(self.sensors_tab, "Sensors"); self._build_sensors_tab()
         self.logs_tab = QWidget(); self.tabs.addTab(self.logs_tab, "Logs"); self._build_logs_tab()
-        self.fw_tab = QWidget(); self.tabs.addTab(self.fw_tab, "Firmware"); self._build_fw_tab()
+        self.fw_tab = FirmwareTab(self)
+        self.tabs.addTab(self.fw_tab, "Firmware")
         self.users_tab = QWidget(); self.tabs.addTab(self.users_tab, "Users"); self._build_users_tab()
+        self.vm_tab = VirtualMediaTab(self)
+        self.tabs.addTab(self.vm_tab, "Virtual Media")
         self.raw_tab = QWidget(); self.tabs.addTab(self.raw_tab, "Raw"); self._build_raw_tab()
         self.console_tab = QWidget(); self.tabs.addTab(self.console_tab, "Console"); self._build_console_tab()
-        self.sol_tab = QWidget(); self.tabs.addTab(self.sol_tab, "SOL Console"); self._build_sol_tab()
 
     # ---------- Styling helpers ----------
     def _apply_theme(self):
@@ -684,7 +653,6 @@ class MainWindow(QMainWindow):
         self.connect_btn.setEnabled(True)
         if ok:
             self.set_status("Connected ✓")
-            # Auto refresh Power + Sensors on connect
             self.on_power_refresh()
             self.on_list_sensors()
         else:
@@ -734,7 +702,7 @@ class MainWindow(QMainWindow):
                            self._on_power_action_done)
 
     def _on_power_action_done(self, ok: bool, data: Any):
-        self.power_out.setPlainText(prety(data) if False else pretty(data))  # safe
+        self.power_out.setPlainText(pretty(data))
         if ok:
             self.set_status(f"Power action sent ✓ (HTTP {data.get('status')})")
             self.on_power_refresh()
@@ -753,12 +721,11 @@ class MainWindow(QMainWindow):
         self.sensors_out = QTextEdit(); self.sensors_out.setReadOnly(True); left.addWidget(self.sensors_out, 1)
 
         right = QVBoxLayout(); mid.addLayout(right, 1)
-        # Bar chart
         self.bar_fig = Figure(figsize=(5, 3), facecolor=self.CARD_BG)
         self.bar_ax = self.bar_fig.add_subplot(111)
         self._style_axes(self.bar_ax)
         self.bar_canvas = FigureCanvas(self.bar_fig); right.addWidget(self.bar_canvas, 2)
-        # Live controls
+        
         ctl = QHBoxLayout(); right.addLayout(ctl)
         ctl.addWidget(self._label("Live sensor:"))
         self.live_combo = QComboBox(); ctl.addWidget(self.live_combo, 1)
@@ -766,7 +733,7 @@ class MainWindow(QMainWindow):
         self.live_interval = QDoubleSpinBox(); self.live_interval.setDecimals(1); self.live_interval.setMinimum(0.5)
         self.live_interval.setMaximum(60.0); self.live_interval.setValue(2.0); ctl.addWidget(self.live_interval)
         self.live_btn = self._button("Start Live", self.on_toggle_live); ctl.addWidget(self.live_btn)
-        # Live chart
+        
         self.live_fig = Figure(figsize=(5, 2.4), facecolor=self.CARD_BG)
         self.live_ax = self.live_fig.add_subplot(111)
         self._style_axes(self.live_ax)
@@ -802,12 +769,10 @@ class MainWindow(QMainWindow):
         readings = body.get("readings", [])
         self.sensors_out.setPlainText(pretty(readings))
 
-        # Populate live combo
         self.live_combo.clear()
         for r in readings:
             self.live_combo.addItem(f'{r["name"]} [{r["units"]}]', r["path"])
 
-        # Draw bar chart
         names = [r["name"] for r in readings if isinstance(r.get("reading"), (int, float))]
         vals = [r["reading"] for r in readings if isinstance(r.get("reading"), (int, float))]
         self.bar_ax.clear(); self._style_axes(self.bar_ax)
@@ -898,13 +863,11 @@ class MainWindow(QMainWindow):
     def _build_fw_tab(self):
         layout = QVBoxLayout(self.fw_tab)
 
-        # Top buttons
         top = QHBoxLayout(); layout.addLayout(top)
         top.addWidget(self._button("List Firmware Inventory", self.on_fw_list))
         top.addWidget(self._button("Show UpdateService", self.on_fw_show_update_service))
         top.addStretch(1)
 
-        # Mode picker
         mode_row = QHBoxLayout(); layout.addLayout(mode_row)
         mode_row.addWidget(self._label("Upload mode:"))
         self.fw_mode = QComboBox()
@@ -926,10 +889,8 @@ class MainWindow(QMainWindow):
             self.image_uri_in.setEnabled(use_simple)
         self.fw_mode.currentIndexChanged.connect(_mode_changed)
 
-        # Output
         self.fw_out = QTextEdit(); self.fw_out.setReadOnly(True); layout.addWidget(self.fw_out, 1)
 
-        # Choose & Upload (single)
         row = QHBoxLayout(); layout.addLayout(row)
         self.choose_btn = self._button(
             "Choose Firmware (.bin/.img/.rom/.cap/.tar/.tar.gz/.tgz)", self.on_choose_fw
@@ -944,7 +905,6 @@ class MainWindow(QMainWindow):
 
         self.fw_path: Optional[str] = None
 
-        # --- Multi-BMC Update ---
         layout.addWidget(self._label("<b>Multi-BMC Firmware Update</b>"))
 
         row_mu_top = QHBoxLayout(); layout.addLayout(row_mu_top)
@@ -981,7 +941,6 @@ class MainWindow(QMainWindow):
         self.multi_log.setPlaceholderText("Multi-update log will appear here…")
         layout.addWidget(self.multi_log, 2)
 
-        # Keep path & queue state (lists, not sets)
         self._multi_fw_path = None
         self._multi_jobs: List[tuple] = []
         self._multi_active: List[QThread] = []
@@ -1017,7 +976,6 @@ class MainWindow(QMainWindow):
             self.fw_path = None
 
     def on_upload_fw(self):
-        # If a local file was chosen, do local-file upload (classic-first)
         if getattr(self, "fw_path", None):
             try:
                 with open(self.fw_path, "rb") as f:
@@ -1030,7 +988,6 @@ class MainWindow(QMainWindow):
                             self._on_fw_upload_done)
             return
 
-        # Otherwise, if user supplied an ImageURI, use SimpleUpdate
         image_uri = self.image_uri_in.text().strip() if hasattr(self, "image_uri_in") else ""
         if image_uri:
             def _simple_update():
@@ -1048,21 +1005,12 @@ class MainWindow(QMainWindow):
 
         self.set_status("Select a firmware file or provide an ImageURI.", error=True)
 
-    def _on_fw_curl_done(self, ok: bool, data: object):
-        self.fw_out.setPlainText(pretty(data))
-        if ok:
-            self.set_status(f"Upload sent ✓ (HTTP {data.get('status') if isinstance(data, dict) else '200'})")
-        else:
-            self.set_status(f"Firmware upload failed: {pretty(data)}", error=True)
-
-
     def _on_fw_upload_done(self, ok: bool, data: Any):
         self.fw_out.setPlainText(pretty(data))
         if ok:
             self.set_status(f"Upload sent ✓ (HTTP {data.get('status')})")
         else:
             self.set_status(f"Firmware upload failed: {pretty(data)}", error=True)
-
 
     # --- Multi-BMC helpers ---
     def _multi_choose_fw(self):
@@ -1076,18 +1024,6 @@ class MainWindow(QMainWindow):
             self.multi_start_btn.setEnabled(True)
 
     def _parse_target_line(self, line: str, default_user: str, default_pass: str):
-        """
-        Parse a line into (scheme, host, port, username, password).
-        Supports:
-          - host
-          - host:port
-          - host user pass
-          - host:port user pass
-          - CSV: host,port,user,pass | host,user,pass
-          - URL: scheme://user:pass@host:port
-          - JSON: {"host": "...", "port": 443, "user": "...", "pass": "...", "scheme": "https"}
-        Falls back to defaults for any missing fields.
-        """
         import json as _json
         from urllib.parse import urlparse
 
@@ -1095,14 +1031,12 @@ class MainWindow(QMainWindow):
         if not s:
             return None
 
-        # Defaults from UI
         scheme = self.scheme_box.currentText().strip() if hasattr(self, "scheme_box") else "https"
         user = default_user
         pw = default_pass
         host = ""
         port = None
 
-        # JSON form
         if s.startswith("{") and s.endswith("}"):
             try:
                 obj = _json.loads(s)
@@ -1112,47 +1046,33 @@ class MainWindow(QMainWindow):
                 if obj.get("scheme"):
                     scheme = str(obj["scheme"]).strip() or scheme
                 if obj.get("port") not in (None, ""):
-                    try:
-                        port = int(obj["port"])
-                    except Exception:
-                        return None
-                if obj.get("user") not in (None, ""):
-                    user = str(obj["user"])
-                if obj.get("pass") not in (None, ""):
-                    pw = str(obj["pass"])
+                    try: port = int(obj["port"])
+                    except Exception: return None
+                if obj.get("user") not in (None, ""): user = str(obj["user"])
+                if obj.get("pass") not in (None, ""): pw = str(obj["pass"])
                 return (scheme, host, port, user, pw)
             except Exception:
                 return None
 
-        # URL with creds: https://user:pass@host:port
         if "://" in s:
             try:
                 p = urlparse(s)
-                if p.scheme:
-                    scheme = p.scheme
-                if p.hostname:
-                    host = p.hostname
-                if p.port:
-                    port = int(p.port)
-                if p.username:
-                    user = p.username
-                if p.password:
-                    pw = p.password
-                if not host:
-                    return None
+                if p.scheme: scheme = p.scheme
+                if p.hostname: host = p.hostname
+                if p.port: port = int(p.port)
+                if p.username: user = p.username
+                if p.password: pw = p.password
+                if not host: return None
                 return (scheme, host, port, user, pw)
             except Exception:
                 return None
 
-        # CSV: host,port,user,pass  OR host,user,pass
         if "," in s:
             parts = [t.strip() for t in s.split(",") if t.strip() != ""]
             if len(parts) == 4:
                 host = parts[0]
-                try:
-                    port = int(parts[1])
-                except Exception:
-                    return None
+                try: port = int(parts[1])
+                except Exception: return None
                 user = parts[2] or user
                 pw = parts[3] or pw
                 return (scheme, host, port, user, pw)
@@ -1162,7 +1082,6 @@ class MainWindow(QMainWindow):
                 pw = parts[2] or pw
                 return (scheme, host, None, user, pw)
 
-        # Space-separated: host[:port] user pass  OR just host[:port]
         toks = s.split()
         if len(toks) >= 1:
             hp = toks[0]
@@ -1178,7 +1097,7 @@ class MainWindow(QMainWindow):
 
             if len(toks) >= 3:
                 user = toks[1]
-                pw = " ".join(toks[2:])  # allow spaces in password if user splits only once
+                pw = " ".join(toks[2:]) 
 
             if not host:
                 return None
@@ -1202,7 +1121,6 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_multi_fw_path", None):
             self.set_status("Select a firmware image for multi-update.", error=True); return
 
-        # Read image once
         try:
             with open(self._multi_fw_path, "rb") as f:
                 self._multi_fw_bytes = f.read()
@@ -1210,16 +1128,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.set_status(f"Read error: {e}", error=True); return
 
-        # Defaults from the connection bar
         default_user = self.user_in.text().strip() if hasattr(self, "user_in") else "root"
         default_pass = self.pass_in.text() if hasattr(self, "pass_in") else "0penBmc"
         verify = self.verify_cb.isChecked() if hasattr(self, "verify_cb") else False
         timeout = float(self.timeout_sb.value()) if hasattr(self, "timeout_sb") else 8.0
 
-        # Normalize state
         self._multi_reset_state()
 
-        # Parse targets
         lines = [ln for ln in self.multi_hosts.toPlainText().splitlines() if ln.strip()]
         targets = []
         for ln in lines:
@@ -1232,7 +1147,6 @@ class MainWindow(QMainWindow):
         if not targets:
             self.set_status("No valid targets provided.", error=True); return
 
-        # Prepare jobs: (scheme, host, port, user, pass, verify, timeout)
         self._multi_jobs = [(sch, h, p, u, pw, verify, timeout) for (sch, h, p, u, pw) in targets]
         self.multi_log.clear()
         self.set_status(f"Starting multi-update: {len(self._multi_jobs)} target(s)")
@@ -1243,10 +1157,8 @@ class MainWindow(QMainWindow):
             return
 
         if not hasattr(self, "_multi_active") or not isinstance(self._multi_active, list):
-            try:
-                self._multi_active = list(self._multi_active)
-            except Exception:
-                self._multi_active = []
+            try: self._multi_active = list(self._multi_active)
+            except Exception: self._multi_active = []
         if not hasattr(self, "_multi_workers") or not isinstance(self._multi_workers, list):
             self._multi_workers = []
 
@@ -1260,8 +1172,8 @@ class MainWindow(QMainWindow):
                 host, port, sch, user, pw, verify, timeout,
                 self._multi_fw_bytes, self._multi_filename, mode="auto"
             )
-            self._multi_workers.append(w)   # prevent GC
-            self._multi_active.append(w)    # track active (LIST)
+            self._multi_workers.append(w)   
+            self._multi_active.append(w)    
             w.finished.connect(self._on_multi_worker_done)
             w.start()
 
@@ -1339,6 +1251,58 @@ class MainWindow(QMainWindow):
         if ok: self.set_status("User deleted ✓"); self.on_users_list()
         else: self.set_status("Failed to delete user.", error=True)
 
+
+# ---- Virtual Media helpers ----
+    def get_virtual_media(self):
+            """Discover Virtual Media endpoints with aggressive OpenBMC fallback."""
+            ok, data, code = self.get("/redfish/v1/Managers")
+            vm_endpoints = []
+            
+            # Standard Dynamic Discovery
+            if ok and isinstance(data.get("data"), dict):
+                members = data["data"].get("Members", [])
+                for m in members:
+                    mgr_id = m.get("@odata.id")
+                    if mgr_id:
+                        vm_url = f"{mgr_id}/VirtualMedia"
+                        ok_vm, vm_data, _ = self.get(vm_url)
+                        if ok_vm and isinstance(vm_data.get("data"), dict):
+                            for v in vm_data["data"].get("Members", []):
+                                v_id = v.get("@odata.id")
+                                if v_id:
+                                    vm_endpoints.append(v_id)
+            
+            # OpenBMC Fallback (If standard discovery returned 0 slots)
+            if not vm_endpoints:
+                self.log("Standard discovery empty. Trying OpenBMC fallback path...")
+                fallback_url = "/redfish/v1/Managers/bmc/VirtualMedia"
+                ok_vm, vm_data, _ = self.get(fallback_url)
+                if ok_vm and isinstance(vm_data.get("data"), dict):
+                    for v in vm_data["data"].get("Members", []):
+                        v_id = v.get("@odata.id")
+                        if v_id:
+                            vm_endpoints.append(v_id)
+                            
+            if not vm_endpoints:
+                return False, {"error": "No VirtualMedia endpoints found on this BMC. Check permissions or BMC firmware support."}, 404
+                
+            return True, {"endpoints": vm_endpoints}, 200
+
+    def get_virtual_media_status(self, endpoint: str) -> Tuple[bool, Any, int]:
+        return self.get(endpoint)
+
+    def insert_virtual_media(self, endpoint: str, image_url: str, user: str = "", password: str = "") -> Tuple[bool, Any, int]:
+        payload = {"Image": image_url, "Inserted": True}
+        if user:
+            payload["UserName"] = user
+        if password:
+            payload["Password"] = password
+        return self.post_json(f"{endpoint}/Actions/VirtualMedia.InsertMedia", payload)
+
+    def eject_virtual_media(self, endpoint: str) -> Tuple[bool, Any, int]:
+        return self.post_json(f"{endpoint}/Actions/VirtualMedia.EjectMedia", {})
+ 
+
     # ---------- Raw Tab ----------
     def _build_raw_tab(self):
         layout = QVBoxLayout(self.raw_tab)
@@ -1375,221 +1339,6 @@ class MainWindow(QMainWindow):
         self.console = QTextEdit(); self.console.setReadOnly(True); layout.addWidget(self.console, 1)
         row = QHBoxLayout(); layout.addLayout(row)
         row.addWidget(self._button("Clear Console", lambda: self.console.clear())); row.addStretch(1)
-
-    # ---------- SOL Console (web only) ----------
-    def _build_sol_tab(self):
-        layout = QVBoxLayout(self.sol_tab)
-
-        # Host row (reuses main connection if empty)
-        r1 = QHBoxLayout(); layout.addLayout(r1)
-        r1.addWidget(self._label("Host/IP:"))
-        self.sol_host = self._edit("", "use main Host/IP if empty")
-        r1.addWidget(self.sol_host, 2)
-        r1.addWidget(self._button("Fill from Connection", self._sol_fill_from_connection))
-        r1.addStretch(1)
-
-        # Buttons
-        r2 = QHBoxLayout(); layout.addLayout(r2)
-        r2.addWidget(self._button("Open Web SOL (auto-login)", self._sol_open_web_autologin))
-        r2.addWidget(self._button("Open Web SOL (plain)", self._sol_open_web_plain))
-        r2.addStretch(1)
-
-        # Hint
-        layout.addWidget(self._label(
-            'Uses main HTTP(S) scheme/port from the Connection bar. '
-            'Auto-login requires Chrome/Chromium + selenium (+ webdriver-manager).'
-        ))
-
-    def _sol_fill_from_connection(self):
-        """Copy the main Connection host/user/pass into the SOL fields (only if empty)."""
-        try:
-            host = self.host_in.text().strip() if hasattr(self, "host_in") else ""
-            if hasattr(self, "sol_host") and (not self.sol_host.text().strip()):
-                self.sol_host.setText(host)
-            self.set_status("SOL fields filled from Connection.")
-        except Exception as e:
-            self.set_status(f"Fill-from-Connection error: {e}", error=True)
-
-    def _sol_open_web_plain(self):
-        # Resolve scheme
-        scheme = "https"
-        if hasattr(self, "scheme_box"):
-            try:
-                val = self.scheme_box.currentText().strip()
-                if val: scheme = val
-            except Exception:
-                pass
-
-        # Resolve host (prefer SOL field, else main)
-        host = ""
-        if hasattr(self, "sol_host"):
-            try:
-                host = self.sol_host.text().strip()
-            except Exception:
-                pass
-        if not host and hasattr(self, "host_in"):
-            try:
-                host = self.host_in.text().strip()
-            except Exception:
-                pass
-        if not host:
-            self.set_status("SOL (web): host/IP required.", error=True); return
-
-        # Optional port from main connection
-        port_txt = ""
-        if hasattr(self, "port_in"):
-            try:
-                port_txt = self.port_in.text().strip()
-                if port_txt: int(port_txt)
-            except Exception:
-                self.set_status("SOL (web): HTTP port must be a number.", error=True); return
-
-        netloc = f"{host}:{port_txt}" if port_txt else host
-        url = f"{scheme}://{netloc}/?next=/login#/console/serial-over-lan-console"
-        self.set_status(f"Opening Web SOL → {url}")
-        webbrowser.open_new(url)
-
-    def _sol_open_web_autologin(self):
-        """Open Web SOL; auto-fill login if Selenium+Chrome available. Falls back to plain open."""
-        # ---------- Resolve scheme/host/port ----------
-        scheme = "https"
-        if hasattr(self, "scheme_box"):
-            try:
-                val = self.scheme_box.currentText().strip()
-                if val: scheme = val
-            except Exception:
-                pass
-
-        host = ""
-        if hasattr(self, "sol_host"):
-            try: host = self.sol_host.text().strip()
-            except Exception: pass
-        if not host and hasattr(self, "host_in"):
-            try: host = self.host_in.text().strip()
-            except Exception: pass
-        if not host:
-            self.set_status("SOL (web): host/IP required.", error=True); return
-
-        port_txt = ""
-        if hasattr(self, "port_in"):
-            try:
-                port_txt = self.port_in.text().strip()
-                if port_txt: int(port_txt)
-            except Exception:
-                self.set_status("SOL (web): HTTP port must be a number.", error=True); return
-
-        netloc = f"{host}:{port_txt}" if port_txt else host
-        console_url = f"{scheme}://{netloc}/?next=/login#/console/serial-over-lan-console"
-        login_url   = f"{scheme}://{netloc}/#/login"
-
-        # ---------- If Selenium missing, just open ----------
-        if webdriver is None or ChromeOptions is None:
-            self.set_status(f"Opening Web SOL (no auto-login) → {console_url}")
-            webbrowser.open_new(console_url)
-            return
-
-        try:
-            # Chrome options
-            opts = ChromeOptions()
-            opts.add_argument("--ignore-certificate-errors")
-            opts.add_argument("--no-first-run")
-            opts.add_argument("--no-default-browser-check")
-            opts.add_argument("--start-maximized")
-
-            import tempfile
-            user_data_dir = tempfile.mkdtemp(prefix="platypus-chrome-")
-            opts.add_argument(f"--user-data-dir={user_data_dir}")
-
-            # ----- Create driver (works for Selenium 3 & 4) -----
-            def _new_chrome(opts_):
-                # Prefer Selenium 4 style with Service + optional manager
-                if ChromeService is not None:
-                    if ChromeDriverManager is not None:
-                        try:
-                            service = ChromeService(executable_path=ChromeDriverManager().install())
-                            return webdriver.Chrome(service=service, options=opts_)
-                        except Exception:
-                            pass
-                    try:
-                        return webdriver.Chrome(service=ChromeService(), options=opts_)
-                    except Exception:
-                        pass
-                # Selenium 3 style (executable_path) and old chrome_options fallback
-                if ChromeDriverManager is not None:
-                    try:
-                        return webdriver.Chrome(executable_path=ChromeDriverManager().install(), options=opts_)
-                    except TypeError:
-                        return webdriver.Chrome(executable_path=ChromeDriverManager().install(), chrome_options=opts_)
-                    except Exception:
-                        pass
-                try:
-                    return webdriver.Chrome(options=opts_)
-                except TypeError:
-                    return webdriver.Chrome(chrome_options=opts_)
-
-            driver = _new_chrome(opts)
-
-            # Helper to find first matching selector
-            def _find_first(selectors, timeout=6):
-                for sel in selectors:
-                    try:
-                        return WebDriverWait(driver, timeout).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                        )
-                    except Exception:
-                        pass
-                return None
-
-            # 1) Hit console first (will redirect to login if needed)
-            driver.get(console_url)
-
-            user_el = _find_first([
-                'input[name="username"]','input#username','input[autocomplete="username"]',
-                'input[type="text"]','input[placeholder*="user" i]','input[placeholder*="User" i]',
-            ], timeout=6)
-            pass_el = _find_first([
-                'input[name="password"]','input#password','input[autocomplete="current-password"]',
-                'input[type="password"]','input[placeholder*="pass" i]',
-            ], timeout=2)
-
-            if user_el is None or pass_el is None:
-                driver.get(login_url)
-                user_el = _find_first([
-                    'input[name="username"]','input#username','input[autocomplete="username"]',
-                    'input[type="text"]','input[placeholder*="user" i]','input[placeholder*="User" i]',
-                ], timeout=8)
-                pass_el = _find_first([
-                    'input[name="password"]','input#password','input[autocomplete="current-password"]',
-                    'input[type="password"]','input[placeholder*="pass" i]',
-                ], timeout=4)
-
-            if user_el is not None and pass_el is not None:
-                username = self.user_in.text().strip() if hasattr(self, "user_in") else "root"
-                password = self.pass_in.text() if hasattr(self, "pass_in") else "0penBmc"
-                try:
-                    user_el.clear(); user_el.send_keys(username)
-                except Exception:
-                    pass
-                try:
-                    from selenium.webdriver.common.keys import Keys
-                    pass_el.clear(); pass_el.send_keys(password); pass_el.send_keys(Keys.ENTER)
-                except Exception:
-                    pass
-
-                try:
-                    WebDriverWait(driver, 8).until(lambda d: "login" not in d.current_url.lower())
-                except Exception:
-                    pass
-
-                driver.get(console_url)
-                self.set_status("Opened Web SOL (auto-login)")
-            else:
-                driver.get(console_url)
-                self.set_status("Opened Web SOL (no login form detected)")
-
-        except Exception as e:
-            self.set_status(f"Auto-login unavailable ({type(e).__name__}: {e}); opening normally.")
-            webbrowser.open_new(console_url)
 
 
 def main():
