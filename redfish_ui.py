@@ -28,9 +28,11 @@ from PyQt5.QtWidgets import (
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
-# Import our new UI module
+# Tabs
 from virtual_media_tab import VirtualMediaTab
 from firmware_tab import FirmwareTab
+from power_tab import PowerTab
+from test_tab import TestTab
 # ---------------------------
 # Backend client
 # ---------------------------
@@ -136,6 +138,23 @@ class RedfishClient:
             return self._parse(r)
         except Exception as e:
             return False, f"{type(e).__name__}: {e}", 0
+        
+    def patch_json(self, endpoint: str, payload: dict) -> Tuple[bool, Any, int]:
+            """Send a PATCH request to update system properties like Boot Options."""
+            self.log(f"PATCH {endpoint} {payload}")
+            headers = {"Content-Type": "application/json"}
+            try:
+                r = self.session.patch(
+                    self.url(endpoint), 
+                    json=payload, 
+                    headers=headers, 
+                    auth=self.auth,
+                    timeout=self.cfg.timeout, 
+                    verify=self.cfg.verify
+                )
+                return self._parse(r)
+            except Exception as e:
+                return False, {"error": f"{type(e).__name__}: {e}"}, 0
 
     def delete(self, path: str) -> Tuple[bool, Any, int]:
         self.log(f"DELETE {path}")
@@ -548,7 +567,8 @@ class MainWindow(QMainWindow):
 
         # ---- Tabs ----
         self.tabs = QTabWidget(); root.addWidget(self.tabs, 1)
-        self.power_tab = QWidget(); self.tabs.addTab(self.power_tab, "Power"); self._build_power_tab()
+        self.power_tab = PowerTab(self)
+        self.tabs.addTab(self.power_tab, "Power/Boot")
         self.sensors_tab = QWidget(); self.tabs.addTab(self.sensors_tab, "Sensors"); self._build_sensors_tab()
         self.logs_tab = QWidget(); self.tabs.addTab(self.logs_tab, "Logs"); self._build_logs_tab()
         self.fw_tab = FirmwareTab(self)
@@ -558,6 +578,37 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.vm_tab, "Virtual Media")
         self.raw_tab = QWidget(); self.tabs.addTab(self.raw_tab, "Raw"); self._build_raw_tab()
         self.console_tab = QWidget(); self.tabs.addTab(self.console_tab, "Console"); self._build_console_tab()
+        self.test_tab = TestTab(self)
+        self.tabs.addTab(self.test_tab, "Diagnostics")
+
+
+
+        self.load_settings()
+
+
+    def load_settings(self):
+        """Loads saved connection details on startup."""
+        if os.path.exists("platypus_config.json"):
+            try:
+                with open("platypus_config.json", "r") as f:
+                    settings = json.load(f)
+                    # Pre-fill the text boxes if the data exists
+                    self.host_in.setText(settings.get("ip", ""))
+                    self.user_in.setText(settings.get("user", ""))
+            except Exception as e:
+                self.set_status(f"Could not load settings: {e}")
+
+    def save_settings(self):
+        """Saves current IP and Username to a local file."""
+        settings = {
+            "ip": self.host_in.text().strip(),
+            "user": self.user_in.text().strip()
+        }
+        try:
+            with open("platypus_config.json", "w") as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            self.set_status(f"Could not save settings: {e}")
 
     # ---------- Styling helpers ----------
     def _apply_theme(self):
@@ -613,50 +664,67 @@ class MainWindow(QMainWindow):
 
     # ---------- Connection ----------
     def on_connect(self):
-        host = self.host_in.text().strip()
-        if not host:
-            self.set_status("Enter host/IP.", error=True); return
-        try:
-            port = int(self.port_in.text()) if self.port_in.text().strip() else None
-        except ValueError:
-            self.set_status("Port must be a number.", error=True); return
-
+        """Triggered when the Connect/Test button is clicked."""
+        if hasattr(self, 'save_settings'):
+            self.save_settings()
+        
+        ip = self.host_in.text().strip()
+        user = self.user_in.text().strip()
+        password = self.pass_in.text()
+        
+        if not ip:
+            self.set_status("Please enter a BMC IP address.", error=True)
+            return
+            
+        self.set_status(f"Connecting to {ip}...")
+        
+        # Disable button to prevent double-clicks
+        if hasattr(self, 'connect_btn'):
+            self.connect_btn.setEnabled(False)
+        
+        # Pull values directly from your UI elements
+        scheme = self.scheme_box.currentText() if hasattr(self, 'scheme_box') else "https"
+        port_str = self.port_in.text().strip() if hasattr(self, 'port_in') else ""
+        port = int(port_str) if port_str.isdigit() else None
+        verify = self.verify_cb.isChecked() if hasattr(self, 'verify_cb') else False
+        timeout = self.timeout_sb.value() if hasattr(self, 'timeout_sb') else 8.0
+        
+        # Use your native RFConfig dataclass
         cfg = RFConfig(
-            scheme=self.scheme_box.currentText(),
-            host=host,
+            scheme=scheme,
+            host=ip,
             port=port,
-            username=self.user_in.text().strip(),
-            password=self.pass_in.text(),
-            verify=self.verify_cb.isChecked(),
-            timeout=float(self.timeout_sb.value()),
-            use_session=self.session_cb.isChecked(),
+            username=user,
+            password=password,
+            verify=verify,
+            timeout=timeout
         )
-        self.client = RedfishClient(cfg, log_fn=lambda m: self.console.append(f"[HTTP] {m}"))
-        base = self.client.base_url()
-        self.set_status(f"Connecting to {base} …")
-        self.connect_btn.setEnabled(False)
+        
+        # Initialize your backend client
+        self.client = RedfishClient(cfg, log_fn=self.log)
+        
+        # Spawn the background worker to test the connection
+        self._spawn_worker(lambda: self.client.get("/redfish/v1"), self._on_connect_done)
 
-        if cfg.use_session:
-            self._spawn_worker(self.client.login, self._on_login_done)
-        else:
-            self._spawn_worker(self.client.test_connection, self._on_connect_done)
-
-    def _on_login_done(self, ok: bool, data: Any):
-        if ok:
-            self.set_status("Session login OK ✓")
-            self._spawn_worker(self.client.test_connection, self._on_connect_done)
-        else:
+    def _on_connect_done(self, ok, data):
+        """Callback for when the background connection test finishes."""
+        if hasattr(self, 'connect_btn'):
             self.connect_btn.setEnabled(True)
-            self.set_status(f"Session login failed: {pretty(data)}", error=True)
-
-    def _on_connect_done(self, ok: bool, data: Any):
-        self.connect_btn.setEnabled(True)
+            
         if ok:
-            self.set_status("Connected ✓")
-            self.on_power_refresh()
-            self.on_list_sensors()
+            self.set_status("Connected successfully!")
+            
+            # --- Auto-Refresh Triggers ---
+            if hasattr(self, 'on_logs_refresh'):
+                self.on_logs_refresh()
+                
+            if hasattr(self, 'power_tab') and hasattr(self.power_tab, 'on_refresh_boot'):
+                self.power_tab.on_refresh_boot()
+                
         else:
-            self.set_status(f"Connection failed: {pretty(data)}", error=True)
+            # Extract and print the exact error message if it fails
+            err_msg = data.get("error", str(data)) if isinstance(data, dict) else str(data)
+            self.set_status(f"Connection failed: {err_msg}", error=True)
 
     def _spawn_worker(self, fn, cb):
         if not self.client:
@@ -671,43 +739,8 @@ class MainWindow(QMainWindow):
         w.start()
 
     # ---------- Power Tab ----------
-    def _build_power_tab(self):
-        layout = QVBoxLayout(self.power_tab)
-        row = QHBoxLayout(); layout.addLayout(row)
-        self.power_state_lbl = self._label("PowerState: (unknown)"); row.addWidget(self.power_state_lbl)
-        row.addWidget(self._button("Refresh State", self.on_power_refresh)); row.addStretch(1)
 
-        row2 = QHBoxLayout(); layout.addLayout(row2)
-        row2.addWidget(self._button("Power On", lambda: self.on_power_action("On")))
-        row2.addWidget(self._button("Force Off", lambda: self.on_power_action("ForceOff")))
-        row2.addWidget(self._button("Graceful Restart", lambda: self.on_power_action("GracefulRestart")))
-        row2.addStretch(1)
 
-        self.power_out = QTextEdit(); self.power_out.setReadOnly(True); layout.addWidget(self.power_out, 1)
-
-    def on_power_refresh(self):
-        self._spawn_worker(lambda: self.client.get("/redfish/v1/Systems/system"), self._on_power_refreshed)
-
-    def _on_power_refreshed(self, ok: bool, data: Any):
-        if ok and isinstance(data, dict) and isinstance(data.get("data"), dict):
-            state = data["data"].get("PowerState")
-            self.power_state_lbl.setText(f"PowerState: {state}")
-        else:
-            self.power_state_lbl.setText(f"PowerState: error -> {pretty(data)}")
-        self.power_out.setPlainText(pretty(data))
-
-    def on_power_action(self, reset_type: str):
-        payload = {"ResetType": reset_type}
-        self._spawn_worker(lambda: self.client.post_json("/redfish/v1/Systems/system/Actions/ComputerSystem.Reset", payload),
-                           self._on_power_action_done)
-
-    def _on_power_action_done(self, ok: bool, data: Any):
-        self.power_out.setPlainText(pretty(data))
-        if ok:
-            self.set_status(f"Power action sent ✓ (HTTP {data.get('status')})")
-            self.on_power_refresh()
-        else:
-            self.set_status(f"Power action failed: {pretty(data)}", error=True)
 
     # ---------- Sensors Tab ----------
     def _build_sensors_tab(self):
@@ -1292,16 +1325,17 @@ class MainWindow(QMainWindow):
         return self.get(endpoint)
 
     def insert_virtual_media(self, endpoint: str, image_url: str, user: str = "", password: str = "") -> Tuple[bool, Any, int]:
-        payload = {"Image": image_url, "Inserted": True}
-        if user:
-            payload["UserName"] = user
-        if password:
-            payload["Password"] = password
-        return self.post_json(f"{endpoint}/Actions/VirtualMedia.InsertMedia", payload)
-
-    def eject_virtual_media(self, endpoint: str) -> Tuple[bool, Any, int]:
-        return self.post_json(f"{endpoint}/Actions/VirtualMedia.EjectMedia", {})
- 
+            # Enforce WriteProtected to satisfy OpenBMC's strict mounting rules
+            payload = {
+                "Image": image_url, 
+                "Inserted": True,
+                "WriteProtected": True
+            }
+            if user:
+                payload["UserName"] = user
+            if password:
+                payload["Password"] = password
+            return self.post_json(f"{endpoint}/Actions/VirtualMedia.InsertMedia", payload)
 
     # ---------- Raw Tab ----------
     def _build_raw_tab(self):
